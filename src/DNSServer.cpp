@@ -38,8 +38,9 @@ bool DNSServer::start() {
   return _udp.listen(_port);
 }
 
-bool DNSServer::start(uint16_t port, const String &domainName, const IPAddress &resolvedIP) {
+bool DNSServer::start(uint16_t port, const String &domainName, const IPAddress &resolvedIP, bool (*filter)(String)) {
   _port = port;
+  _filter = filter;
   if (domainName != "*") {
     _domainName = domainName;
     downcaseAndRemoveWwwPrefix(_domainName);
@@ -70,6 +71,36 @@ void DNSServer::stop() {
 void DNSServer::downcaseAndRemoveWwwPrefix(String &domainName) {
   domainName.toLowerCase();
   domainName.replace("www.", "");
+}
+
+void DNSServer::replyWithIP(AsyncUDPPacket &req, DNSHeader &dnsHeader, DNSQuestion &dnsQuestion, const IPAddress &resolvedIP)
+{
+  AsyncUDPMessage rpl;
+  // Change the type of message to a response and set the number of answers equal to
+  // the number of questions in the header
+  dnsHeader.QR = DNS_QR_RESPONSE;
+  dnsHeader.ANCount = dnsHeader.QDCount;
+  rpl.write((unsigned char *)&dnsHeader, DNS_HEADER_SIZE);
+  // Write the question
+  rpl.write(dnsQuestion.QName, dnsQuestion.QNameLength);
+  rpl.write((uint8_t *)&dnsQuestion.QType, 2);
+  rpl.write((uint8_t *)&dnsQuestion.QClass, 2);
+  // Write the answer
+  // Use DNS name compression : instead of repeating the name in this RNAME occurrence,
+  // set the two MSB of the byte corresponding normally to the length to 1. The following
+  // 14 bits must be used to specify the offset of the domain name in the message
+  // (<255 here so the first byte has the 6 LSB at 0)
+  rpl.write((uint8_t)0xC0);
+  rpl.write((uint8_t)DNS_OFFSET_DOMAIN_NAME);
+  // DNS type A : host address, DNS class IN for INternet, returning an IPv4 address
+  uint16_t answerType = htons(DNS_TYPE_A), answerClass = htons(DNS_CLASS_IN), answerIPv4 = htons(DNS_RDLENGTH_IPV4);
+  rpl.write((unsigned char *)&answerType, 2);
+  rpl.write((unsigned char *)&answerClass, 2);
+  rpl.write((unsigned char *)&_ttl, 4);  // DNS Time To Live
+  rpl.write((unsigned char *)&answerIPv4, 2);
+  uint32_t ip = uint32_t(resolvedIP);
+  rpl.write(reinterpret_cast<uint8_t *>(&ip), sizeof(uint32_t));  // The IPv4 address to return
+  _udp.sendTo(rpl, req.remoteIP(), req.remotePort());
 }
 
 void DNSServer::_handleUDP(AsyncUDPPacket &pkt) {
@@ -108,20 +139,30 @@ void DNSServer::_handleUDP(AsyncUDPPacket &pkt) {
     memcpy(&dnsQuestion.QClass, enoflbls + sizeof(dnsQuestion.QType), sizeof(dnsQuestion.QClass));
   }
 
-  // will reply with IP only to "*" or if domain matches without www. subdomain
-  if (dnsHeader.OPCode == DNS_OPCODE_QUERY && requestIncludesOnlyOneQuestion(dnsHeader)
-      && (_domainName.isEmpty() || getDomainNameWithoutWwwPrefix(static_cast<const unsigned char *>(dnsQuestion.QName), dnsQuestion.QNameLength) == _domainName)) {
 
-    // Qtype = A (1) or ANY (255): send an A record otherwise an empty response
-    if (ntohs(dnsQuestion.QType) == 1 || ntohs(dnsQuestion.QType) == 255) {
-      replyWithIP(pkt, dnsHeader, dnsQuestion);
-    } else {
-      replyWithNoAnsw(pkt, dnsHeader, dnsQuestion);
-    }
+  String domain = getDomainNameWithoutWwwPrefix(static_cast<const unsigned char *>(dnsQuestion.QName), dnsQuestion.QNameLength);
+  uint32_t filter_start = millis();
+  bool filter_res = _filter(domain);
+  uint32_t filter_end = millis();
+  if (filter_res) {
+    Serial.printf(" | Blocked\n");
+    Serial.printf("Find took %lu ms\n", filter_end - filter_start);
+    replyWithIP(pkt, dnsHeader, dnsQuestion, IPAddress(0,0,0,0));
     return;
   }
-  // otherwise reply with custom code
-  replyWithCustomCode(pkt, dnsHeader);
+
+  IPAddress ip;
+  uint32_t resolve_start = millis();
+  WiFi.hostByName(domain.c_str(), ip);
+  uint32_t resolve_end = millis();
+  replyWithIP(pkt, dnsHeader, dnsQuestion, ip);
+
+  // Resolve print
+  Serial.printf(" | IP:");
+  Serial.print(ip);
+  Serial.printf("\nResolve took %lu ms", resolve_end - resolve_start);
+  Serial.printf(" | Find took %lu ms\n", filter_end - filter_start);
+  return;
 }
 
 bool DNSServer::requestIncludesOnlyOneQuestion(DNSHeader &dnsHeader) {
@@ -130,7 +171,7 @@ bool DNSServer::requestIncludesOnlyOneQuestion(DNSHeader &dnsHeader) {
 }
 
 String DNSServer::getDomainNameWithoutWwwPrefix(const unsigned char *start, size_t len) {
-  String parsedDomainName(start, --len);  // exclude trailing null byte from labels length, String constructor will add it anyway
+  String parsedDomainName(start, len-sizeof(""));  // exclude trailing null byte from labels length, String constructor will add it anyway
 
   size_t pos = 0;
   while (pos < len) {
@@ -143,45 +184,45 @@ String DNSServer::getDomainNameWithoutWwwPrefix(const unsigned char *start, size
   return parsedDomainName;
 }
 
-void DNSServer::replyWithIP(AsyncUDPPacket &req, DNSHeader &dnsHeader, DNSQuestion &dnsQuestion) {
-  AsyncUDPMessage rpl;
-  // Change the type of message to a response and set the number of answers equal to
-  // the number of questions in the header
-  dnsHeader.QR = DNS_QR_RESPONSE;
-  dnsHeader.ANCount = dnsHeader.QDCount;
-  rpl.write((unsigned char *)&dnsHeader, DNS_HEADER_SIZE);
+// void DNSServer::replyWithIP(AsyncUDPPacket &req, DNSHeader &dnsHeader, DNSQuestion &dnsQuestion) {
+//   AsyncUDPMessage rpl;
+//   // Change the type of message to a response and set the number of answers equal to
+//   // the number of questions in the header
+//   dnsHeader.QR = DNS_QR_RESPONSE;
+//   dnsHeader.ANCount = dnsHeader.QDCount;
+//   rpl.write((unsigned char *)&dnsHeader, DNS_HEADER_SIZE);
 
-  // Write the question
-  rpl.write(dnsQuestion.QName, dnsQuestion.QNameLength);
-  rpl.write((uint8_t *)&dnsQuestion.QType, 2);
-  rpl.write((uint8_t *)&dnsQuestion.QClass, 2);
+//   // Write the question
+//   rpl.write(dnsQuestion.QName, dnsQuestion.QNameLength);
+//   rpl.write((uint8_t *)&dnsQuestion.QType, 2);
+//   rpl.write((uint8_t *)&dnsQuestion.QClass, 2);
 
-  // Write the answer
-  // Use DNS name compression : instead of repeating the name in this RNAME occurrence,
-  // set the two MSB of the byte corresponding normally to the length to 1. The following
-  // 14 bits must be used to specify the offset of the domain name in the message
-  // (<255 here so the first byte has the 6 LSB at 0)
-  rpl.write((uint8_t)0xC0);
-  rpl.write((uint8_t)DNS_OFFSET_DOMAIN_NAME);
+//   // Write the answer
+//   // Use DNS name compression : instead of repeating the name in this RNAME occurrence,
+//   // set the two MSB of the byte corresponding normally to the length to 1. The following
+//   // 14 bits must be used to specify the offset of the domain name in the message
+//   // (<255 here so the first byte has the 6 LSB at 0)
+//   rpl.write((uint8_t)0xC0);
+//   rpl.write((uint8_t)DNS_OFFSET_DOMAIN_NAME);
 
-  // DNS type A : host address, DNS class IN for INternet, returning an IPv4 address
-  uint16_t answerType = htons(DNS_TYPE_A), answerClass = htons(DNS_CLASS_IN), answerIPv4 = htons(DNS_RDLENGTH_IPV4);
-  rpl.write((unsigned char *)&answerType, 2);
-  rpl.write((unsigned char *)&answerClass, 2);
-  rpl.write((unsigned char *)&_ttl, 4);  // DNS Time To Live
-  rpl.write((unsigned char *)&answerIPv4, 2);
-  uint32_t ip = _resolvedIP;
-  rpl.write(reinterpret_cast<uint8_t *>(&ip), sizeof(uint32_t));  // The IPv4 address to return
+//   // DNS type A : host address, DNS class IN for INternet, returning an IPv4 address
+//   uint16_t answerType = htons(DNS_TYPE_A), answerClass = htons(DNS_CLASS_IN), answerIPv4 = htons(DNS_RDLENGTH_IPV4);
+//   rpl.write((unsigned char *)&answerType, 2);
+//   rpl.write((unsigned char *)&answerClass, 2);
+//   rpl.write((unsigned char *)&_ttl, 4);  // DNS Time To Live
+//   rpl.write((unsigned char *)&answerIPv4, 2);
+//   uint32_t ip = _resolvedIP;
+//   rpl.write(reinterpret_cast<uint8_t *>(&ip), sizeof(uint32_t));  // The IPv4 address to return
 
-  _udp.sendTo(rpl, req.remoteIP(), req.remotePort());
+//   _udp.sendTo(rpl, req.remoteIP(), req.remotePort());
 
-#ifdef DEBUG_ESP_DNS
-  DEBUG_OUTPUT.printf(
-    "DNS responds: %s for %s\n", _resolvedIP.toString().c_str(),
-    getDomainNameWithoutWwwPrefix(static_cast<const unsigned char *>(dnsQuestion.QName), dnsQuestion.QNameLength).c_str()
-  );
-#endif
-}
+// #ifdef DEBUG_ESP_DNS
+//   DEBUG_OUTPUT.printf(
+//     "DNS responds: %s for %s\n", _resolvedIP.toString().c_str(),
+//     getDomainNameWithoutWwwPrefix(static_cast<const unsigned char *>(dnsQuestion.QName), dnsQuestion.QNameLength).c_str()
+//   );
+// #endif
+// }
 
 void DNSServer::replyWithCustomCode(AsyncUDPPacket &req, DNSHeader &dnsHeader) {
   dnsHeader.QR = DNS_QR_RESPONSE;

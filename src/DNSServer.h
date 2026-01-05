@@ -148,7 +148,7 @@ public:
      * @return true on success
      * @return false if IP or socket error
      */
-  bool start(uint16_t port, const String &domainName, const IPAddress &resolvedIP);
+  bool start(uint16_t port, const String &domainName, const IPAddress &resolvedIP, bool (*filter)(String));
 
   /**
      * @brief stops the server and close UDP socket
@@ -184,6 +184,7 @@ private:
   DNSReplyCode _errorReplyCode;
   String _domainName;
   IPAddress _resolvedIP;
+  bool (*_filter)(String);
 
   void downcaseAndRemoveWwwPrefix(String &domainName);
 
@@ -197,9 +198,10 @@ private:
      */
   String getDomainNameWithoutWwwPrefix(const unsigned char *start, size_t len);
   inline bool requestIncludesOnlyOneQuestion(DNSHeader &dnsHeader);
-  void replyWithIP(AsyncUDPPacket &req, DNSHeader &dnsHeader, DNSQuestion &dnsQuestion);
+  // void replyWithIP(AsyncUDPPacket &req, DNSHeader &dnsHeader, DNSQuestion &dnsQuestion);
   inline void replyWithCustomCode(AsyncUDPPacket &req, DNSHeader &dnsHeader);
   inline void replyWithNoAnsw(AsyncUDPPacket &req, DNSHeader &dnsHeader, DNSQuestion &dnsQuestion);
+  void replyWithIP(AsyncUDPPacket &req, DNSHeader &dnsHeader, DNSQuestion &dnsQuestion, const IPAddress &resolvedIP);
 
   void _handleUDP(AsyncUDPPacket &pkt);
 };
